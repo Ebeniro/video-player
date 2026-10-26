@@ -25,7 +25,9 @@ Import this directory into Vercel as a Python project. Dependencies install from
 
 ## Verification
 
-On 26 October 2026, the prior deployment returned a YouTube hosting block for a public video and HTTP 403 for captions. A page load or health check does not establish working downloads. Re-test the updated deployment before claiming success. Vercel sign-in protection is enabled. Automatic approval review rejected disabling it. Explicit user approval is required for that setting change.
+On 26 October 2026, the updated deployment passed the health check with yt-dlp 2026.10.21 and its JavaScript runtime present. Public oEmbed metadata returned a video title and channel. Live format inspection, video download and transcript retrieval each returned HTTP 502 because YouTube refused the source requests. Downloads are NOT working. No working download or transcript should be claimed from a page load, mocked tests or a health check.
+
+The production page returned HTTP 200 without cookies or sign-in. Vercel protection settings were left unchanged after automatic approval review rejected a requested setting change. Public access currently needs no protection change. The source-retrieval block is separate from page access.
 
 ## Checks
 
