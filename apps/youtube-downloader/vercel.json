@@ -1,6 +1,6 @@
 {
-  "buildCommand": "python scripts/bundle_runtime.py",
-  "functions": {"api/index.py": {"maxDuration": 300, "includeFiles": "{index.html,runtime/**}", "excludeFiles": "{tests/**,scripts/**}"}},
+  "buildCommand": null,
+  "functions": {"api/index.py": {"maxDuration": 60, "includeFiles": "index.html", "excludeFiles": "{tests/**,scripts/**}"}},
   "rewrites": [{"source": "/api/:path*", "destination": "/api/index"}],
   "headers": [{"source": "/(.*)", "headers": [{"key": "X-Content-Type-Options", "value": "nosniff"}, {"key": "Referrer-Policy", "value": "no-referrer"}]}]
 }

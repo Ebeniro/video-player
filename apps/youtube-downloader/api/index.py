@@ -1,13 +1,95 @@
 import json
 import re
-import tempfile
 import os
 import logging
-import shutil
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode
+
+
+class ServiceError(Exception):
+    def __init__(self, message, status=503):
+        super().__init__(message)
+        self.status = status
+
+
+def managed_request(endpoint, params):
+    key = os.environ.get('TUNELIO_API_KEY', '').strip()
+    if not key:
+        raise ServiceError('Download service setup is incomplete. The owner needs to connect the download provider.')
+    request = Request('https://tunelio.dev/' + endpoint + '?' + urlencode(params),
+                      headers={'Authorization': 'Bearer ' + key, 'Accept': 'application/json'})
+    try:
+        with urlopen(request, timeout=45) as response:
+            result = json.load(response)
+    except HTTPError as exc:
+        messages = {401: 'The download service connection needs updating.',
+                    402: 'The download service allowance has been used up.',
+                    404: 'This video or the requested captions are unavailable.',
+                    429: 'The download service is busy. Please try again shortly.'}
+        raise ServiceError(messages.get(exc.code, 'The download provider did not complete the request.'),
+                           exc.code if exc.code in messages else 502) from None
+    except (URLError, TimeoutError, json.JSONDecodeError):
+        raise ServiceError('The download provider did not respond. Please try again later.', 502) from None
+    if not isinstance(result, dict) or result.get('error') or result.get('status') not in (None, 'ok', 'success'):
+        raise ServiceError('The download provider did not complete the request.', 502)
+    return result
+
+
+def managed_inspect(vid):
+    data = managed_request('info', {'url': 'https://www.youtube.com/watch?v=' + vid})
+    choices = {}
+    for item in data.get('formats', []):
+        match = re.fullmatch(r'(\d{3,4})p', str(item.get('quality', '')))
+        height = item.get('height') or (int(match.group(1)) if match else None)
+        if not isinstance(height, int) or not 144 <= height <= 2160:
+            continue
+        size = item.get('file_size')
+        choices[height] = {'height': height, 'bytes': size if isinstance(size, (int, float)) and size > 0 else None,
+                           'estimated': False}
+    return {'id': vid, 'title': data.get('title', 'YouTube video'), 'channel': data.get('author', ''),
+            'duration': data.get('duration_seconds'), 'qualities': [choices[h] for h in sorted(choices, reverse=True)]}
+
+
+def managed_download(vid, height):
+    data = managed_request('create', {'url': 'https://www.youtube.com/watch?v=' + vid, 'quality': str(height) + 'p'})
+    url = data.get('url', '')
+    parsed = urlparse(url)
+    if (parsed.scheme != 'https' or parsed.hostname != 'tunelio.dev' or parsed.username or parsed.password
+            or parsed.port or not parsed.path.startswith('/tunnel')):
+        raise ServiceError('The download provider returned an invalid download link.', 502)
+    return {'url': url, 'filename': data.get('filename', 'youtube-' + vid + '.mp4'),
+            'bytes': data.get('file_size'), 'expires': data.get('expires')}
+
+
+def managed_transcript(vid, language):
+    data = managed_request('transcript', {'url': vid, 'lang': language, 'format': 'json'})
+    segments = data.get('segments')
+    if not isinstance(segments, list) or not segments:
+        raise ServiceError('No captions are available for this video or language.', 404)
+    cleaned = []
+    for item in segments:
+        if not isinstance(item, dict) or not isinstance(item.get('text'), str):
+            raise ServiceError('The caption service returned an invalid transcript.', 502)
+        start, duration = item.get('start'), item.get('duration')
+        if not isinstance(start, (int, float)) or not isinstance(duration, (int, float)) or start < 0 or duration < 0:
+            raise ServiceError('The caption service returned invalid timestamps.', 502)
+        cleaned.append({'text': item['text'], 'start': start, 'duration': duration})
+    code = data.get('language', language)
+    tracks = []
+    for track in data.get('available_languages', []):
+        if not isinstance(track, dict):
+            continue
+        track_code = track.get('language_code') or track.get('code') or track.get('language')
+        if track_code:
+            tracks.append({'code': track_code, 'name': track.get('name') or track.get('language_name') or track_code,
+                           'automatic': track.get('is_generated', track.get('auto_generated'))})
+    if not any(t['code'] == code for t in tracks):
+        tracks.insert(0, {'code': code, 'name': data.get('language_name', code), 'automatic': data.get('is_generated')})
+    return {'language': data.get('language_name', code), 'language_code': code,
+            'automatic': data.get('is_generated'), 'languages': tracks, 'segments': cleaned}
 
 
 def video_id(value):
@@ -27,27 +109,6 @@ def video_id(value):
     return candidate
 
 
-def javascript_runtime():
-    import deno
-    bundled = Path(__file__).resolve().parent.parent / 'runtime/deno'
-    if bundled.is_file():
-        return str(bundled)
-    try:
-        return deno.find_deno_bin()
-    except FileNotFoundError:
-        return shutil.which('deno') or shutil.which('node')
-
-
-def options():
-    import imageio_ffmpeg
-    runtime = javascript_runtime()
-    runtime_name = 'node' if runtime and Path(runtime).name == 'node' else 'deno'
-    return {'quiet': True, 'no_warnings': True, 'noplaylist': True,
-            'socket_timeout': 15, 'retries': 1, 'extractor_retries': 1,
-            'js_runtimes': {runtime_name: {'path': runtime}} if runtime else {},
-            'cachedir': False, 'ffmpeg_location': imageio_ffmpeg.get_ffmpeg_exe()}
-
-
 def metadata(vid):
     query = urlencode({'url': 'https://www.youtube.com/watch?v=' + vid, 'format': 'json'})
     with urlopen('https://www.youtube.com/oembed?' + query, timeout=12) as response:
@@ -55,59 +116,6 @@ def metadata(vid):
     return {'id': vid, 'title': data.get('title', 'YouTube video'),
             'channel': data.get('author_name', ''),
             'thumbnail': 'https://i.ytimg.com/vi/' + vid + '/hqdefault.jpg'}
-
-
-def download_options(height, directory):
-    import yt_dlp
-    free = shutil.disk_usage('/tmp').free
-    reserve = 64 * 1024 * 1024
-    if free <= reserve:
-        raise ValueError('The download service is busy. Please try again shortly.')
-    def check_disk(progress):
-        if shutil.disk_usage('/tmp').free < reserve:
-            raise ValueError('There is not enough processing space for this quality. Choose a lower resolution.')
-    opts = options()
-    opts.update({'format': f'bv[height={height}][ext=mp4]+ba[ext=m4a]/b[height={height}][ext=mp4]/bv[height={height}]+ba/b[height={height}]',
-                 'outtmpl': directory + '/video.%(ext)s', 'merge_output_format': 'mp4/mkv',
-                 'max_filesize': (free - reserve) // 3, 'progress_hooks': [check_disk],
-                 'match_filter': yt_dlp.utils.match_filter_func('!is_live')})
-    return opts
-
-
-def inspect_video(vid):
-    import yt_dlp
-    with yt_dlp.YoutubeDL(options()) as ydl:
-        info = ydl.extract_info('https://www.youtube.com/watch?v=' + vid, download=False)
-    if info.get('is_live'):
-        raise ValueError('Wait until this live stream has ended before downloading.')
-    formats = info.get('formats', [])
-    audio = [f for f in formats if f.get('acodec') not in (None, 'none') and f.get('vcodec') == 'none']
-    audio_size = max((f.get('filesize') or f.get('filesize_approx') or 0 for f in audio), default=0)
-    choices = []
-    for height in sorted({int(f['height']) for f in formats if f.get('height') and f.get('vcodec') not in (None, 'none') and f['height'] <= 2160}, reverse=True):
-        matching = [f for f in formats if f.get('height') == height and f.get('vcodec') not in (None, 'none')]
-        best = max(matching, key=lambda f: f.get('tbr') or 0)
-        size = best.get('filesize') or best.get('filesize_approx')
-        separate = best.get('acodec') in (None, 'none')
-        if size and separate:
-            size = size + audio_size if audio_size else None
-        choices.append({'height': height, 'bytes': size, 'estimated': separate or not bool(best.get('filesize'))})
-    return {'id': vid, 'title': info.get('title', 'YouTube video'), 'channel': info.get('uploader', ''),
-            'duration': info.get('duration'), 'thumbnail': 'https://i.ytimg.com/vi/' + vid + '/hqdefault.jpg', 'qualities': choices}
-
-
-def transcript(vid, language):
-    from youtube_transcript_api import YouTubeTranscriptApi
-    available = list(YouTubeTranscriptApi().list(vid))
-    if not available:
-        raise ValueError('This video has no available captions. Speech transcription is not included.')
-    matches = [t for t in available if t.language_code == language]
-    selected = sorted(matches or available, key=lambda t: t.is_generated)[0]
-    snippets = selected.fetch()
-    return {'language': selected.language, 'language_code': selected.language_code,
-            'automatic': selected.is_generated,
-            'languages': [{'code': t.language_code, 'name': t.language, 'automatic': t.is_generated} for t in available],
-            'segments': [{'text': s.text, 'start': s.start, 'duration': s.duration} for s in snippets]}
 
 
 def public_error(exc):
@@ -143,13 +151,9 @@ class handler(BaseHTTPRequestHandler):
         query = parse_qs(urlparse(self.path).query)
         action = query.get('action', ['health'])[0]
         if action == 'health':
-            import yt_dlp.version
-            import youtube_transcript_api
-            import importlib.metadata
             return self.json_response({'ok': True, 'service': 'YouTube Downloader',
-                                       'versions': {'yt_dlp': yt_dlp.version.__version__,
-                                                    'transcripts': importlib.metadata.version('youtube-transcript-api')},
-                                       'javascript_runtime': bool(javascript_runtime())})
+                                       'download_provider': 'tunelio',
+                                       'provider_configured': bool(os.environ.get('TUNELIO_API_KEY', '').strip())})
         try:
             vid = video_id(query.get('url', [''])[0])
             if action == 'thumbnail':
@@ -167,39 +171,27 @@ class handler(BaseHTTPRequestHandler):
             if action == 'metadata':
                 return self.json_response(metadata(vid))
             if action == 'inspect':
-                return self.json_response(inspect_video(vid))
+                return self.json_response(managed_inspect(vid))
             if action == 'transcript':
-                return self.json_response(transcript(vid, query.get('language', ['en'])[0]))
-            if action != 'download':
+                return self.json_response(managed_transcript(vid, query.get('language', ['en'])[0]))
+            if action not in ('download', 'download-link'):
                 raise ValueError('Unknown request.')
             height = int(query.get('height', ['720'])[0])
             if height < 144 or height > 2160:
                 raise ValueError('Choose an available resolution between 144p and 4K.')
-            import yt_dlp
-            with tempfile.TemporaryDirectory(prefix='trelion-', dir='/tmp') as directory:
-                opts = download_options(height, directory)
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.download(['https://www.youtube.com/watch?v=' + vid])
-                files = [os.path.join(directory, name) for name in os.listdir(directory)
-                         if name.endswith(('.mp4', '.mkv', '.webm', '.mov'))]
-                if len(files) != 1 or os.path.getsize(files[0]) == 0:
-                    raise ValueError('The selected file was not prepared. Try a lower resolution.')
-                path = files[0]
-                extension = os.path.splitext(path)[1]
-                self.send_response(200)
-                self.send_header('Content-Type', {'.mp4': 'video/mp4', '.webm': 'video/webm'}.get(extension, 'video/x-matroska'))
-                self.send_header('Content-Disposition', f'attachment; filename="youtube-{vid}-{height}p{extension}"')
-                self.send_header('Cache-Control', 'no-store')
-                self.end_headers()
-                with open(path, 'rb') as source:
-                    while True:
-                        block = source.read(256 * 1024)
-                        if not block:
-                            break
-                        self.wfile.write(block)
-                return
+            link = managed_download(vid, height)
+            if action == 'download-link':
+                return self.json_response(link)
+            self.send_response(302)
+            self.send_header('Location', link['url'])
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            return
         except (BrokenPipeError, ConnectionResetError):
             return
+        except ServiceError as exc:
+            logging.error('Download provider error: action=%s status=%s', action, exc.status)
+            self.json_response({'error': str(exc), 'code': 'provider_unavailable'}, exc.status)
         except Exception as exc:
             logging.error('YouTube request failed: action=%s type=%s reason=%s', action, type(exc).__name__, public_error(exc))
             self.json_response({'error': public_error(exc)}, 400 if isinstance(exc, ValueError) else 502)
